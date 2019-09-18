@@ -1,8 +1,11 @@
 #include "pch.h"
 #include <fstream>
 #include <algorithm>
+#include <set>
+#include <cassert>
 #include <tclap/CmdLine.h>
 #include <tclap/ValueArg.h>
+#include <fmt/format.h>
 #include "task.hpp"
 
 namespace tc = TCLAP;
@@ -43,11 +46,8 @@ namespace interlace
 
 		std::string random;
 		std::string target;
-		std::string target_list;
 		std::string command;
-		std::string command_list;
 		std::string exclusion;
-		std::string exclusion_list;
 		std::string proxy_list;
 		std::string output;
 		std::string port;
@@ -126,12 +126,17 @@ namespace interlace
 		cmd_arguments.no_bar = no_bar.getValue();
 		cmd_arguments.silent = silent.getValue();
 		cmd_arguments.verbose = verbose.getValue();
-		cmd_arguments.exclusion = exclusion.getValue();
-		cmd_arguments.exclusion_list = exclusion_list.getValue();
-		cmd_arguments.command = command.getValue();
-		cmd_arguments.command_list = command_list.getValue();
-		cmd_arguments.target = target.getValue();
-		cmd_arguments.target_list = target_list.getValue();
+
+		// exclusion and exclusion list are optional, they may both be empty
+		if( exclusion.isSet() ){
+			cmd_arguments.exclusion = exclusion.getValue();
+		} else if( exclusion_list.isSet() ){
+			cmd_arguments.exclusion = "``" + exclusion_list.getValue();
+		}
+		cmd_arguments.command = command.isSet() ? command.getValue() :
+			"``" + command_list.getValue();
+		cmd_arguments.target = target.isSet() ? target.getValue() :
+			"``" + target_list.getValue();
 
 		return cmd_arguments;
 	}
@@ -139,8 +144,7 @@ namespace interlace
 	StringList split_string( std::string const & str, char sep )
 	{
 		StringList result{};
-		int offset = 0;
-		int found = str.find( sep, offset );
+		int offset{}, found = str.find( sep, offset );
 		while( found != std::string::npos ){
 			result.push_back( str.substr( offset, found - offset ) );
 			offset = found;
@@ -149,27 +153,137 @@ namespace interlace
 		return result;
 	}
 
-	std::string strip( std::string const & str )
+	void strip( std::string & str )
 	{
 		char const *sep = " \n\r\t";
-		auto temp = str;
-		temp.erase( temp.find_last_not_of( sep ) + 1 ); // rtrim strip
-		auto index = temp.find_first_not_of( temp );
-		if( index == std::string::npos ) return temp;
-		return temp.substr( index ); // return ltrim
+		str.erase( str.find_last_not_of( sep ) + 1 ); // rtrim strip
+		auto const index = str.find_first_not_of( sep );
+		if( index == std::string::npos ) return;
+		str.erase( 0, index ); //ltrim
 	}
 
-	void pre_process_hosts( StringList const & host_ranges, 
+	StringList ip_range( unsigned int const ip_start, unsigned int const ip_end )
+	{
+		unsigned int const ip_1 = ip_start, ip_2 = ip_end;
+		
+		int const ip1_first_byte = ip_1 >> 24, ip1_second_byte = ( ip_1 >> 16 ) & 0xFF,
+			ip1_third_byte = ( ip_1 >> 8 ) & 0xFF, ip1_last_byte = ip_1 & 0xFF;
+		
+		int const ip2_first_byte = ip_2 >> 24, ip2_second_byte = ( ip_2 >> 16 ) & 0xFF,
+			ip2_third_byte = ( ip_2 >> 8 ) & 0xFF, ip2_last_byte = ip_2 & 0xFF;
+		
+		StringList ip_list{};
+
+		for( int i0 = ip1_first_byte; i0 <= ip2_first_byte; ++i0 ){
+			for( int i1 = ip1_second_byte; i1 <= ip2_second_byte; ++i1 ){
+				for( int i2 = ip1_third_byte; i2 <= ip2_third_byte; ++i2 ){
+					for( int i3 = ip1_last_byte; i3 <= ip2_last_byte; ++i3 ){
+						ip_list.push_back( fmt::format( "{}.{}.{}.{}", i0, i1, i2, i3 ) );
+					}
+				}
+			}
+		}
+		return ip_list;
+	}
+
+	StringList cidrs_to_ips( std::string const & ip )
+	{
+		auto parts = split_string( ip, '.' );
+		assert( parts.size() == 4 );
+		auto last_part = split_string( parts[3], '/' );
+		assert( last_part.size() == 2 );
+		parts[3] = last_part[0];
+		uint32_t ip_num = std::stoi( parts[0] ) << 24 |
+			std::stoi( parts[1] ) << 16 |
+			std::stoi( parts[2] ) << 8 |
+			std::stoi( parts[3] );
+		int mask_bits = std::stoi( last_part[1] );
+		unsigned int mask = 0xFFFFFFFF;
+		mask <<= ( 32 - mask_bits );
+		unsigned int ip_start = ip_num & mask;
+		unsigned int ip_end = ip_num | ~mask;
+		return ip_range( ip_start, ip_end );
+	}
+
+	StringList ip_from_range( std::string const & ip )
+	{
+		StringList ip_range = split_string( ip, '-' );
+		assert( ip_range.size() == 2 );
+		auto first_range = split_string( ip_range[0], '.' );
+		std::string end_ip{};
+		for( int i = 0; i != first_range.size() - 1; ++i ){
+			end_ip += ( first_range[i] + "." );
+		}
+		end_ip += ip_range[1];
+
+		auto ip1 = split_string( ip_range[0], '.' );
+		auto ip2 = split_string( end_ip, '.' );
+		assert( ip1.size() == 4 && ip2.size() == 4 );
+
+		int const ip1_first_byte = std::stoi( ip1[0] ), ip1_second_byte = std::stoi( ip1[1] ),
+			ip1_third_byte = std::stoi( ip1[2] ), ip1_last_byte = std::stoi( ip1[3] );
+		int const ip2_first_byte = std::stoi( ip2[0] ), ip2_second_byte = std::stoi( ip2[1] ),
+			ip2_third_byte = std::stoi( ip2[2] ), ip2_last_byte = std::stoi( ip2[3] );
+		StringList ip_list{};
+
+		for( int i0 = ip1_first_byte; i0 <= ip2_first_byte; ++i0 ){
+			for( int i1 = ip1_second_byte; i1 <= ip2_second_byte; ++i1 ){
+				for( int i2 = ip1_third_byte; i2 <= ip2_third_byte; ++i2 ){
+					for( int i3 = ip1_last_byte; i3 <= ip2_last_byte; ++i3 ){
+						ip_list.push_back( fmt::format( "{}.{}.{}.{}", i0, i1, i2, i3 ) );
+					}
+				}
+			}
+		}
+		return ip_list;
+	}
+
+
+	StringList ip_from_glob( std::string const & glob )
+	{
+		//TODO
+		return StringList{};
+	}
+
+	void pre_process_hosts( std::set<std::string> & host_ranges,
 		Argument const & argument, StringList& destination )
 	{
-
+		for( auto const& h : host_ranges ){
+			// remove all spaces
+			auto host = h;
+			host.erase( std::remove( host.begin(), host.end(), ' ' ), host.end() );
+			for( auto const & ip : split_string( host, ',' ) ){
+				auto const dot_split = split_string( ip, '.' );
+				if( !dot_split.empty() && !dot_split.back().empty() ){
+					if( isalpha( dot_split.back()[0] ) ){
+						destination.push_back( ip );
+						continue;
+					}
+				}
+				if( !argument.no_cidr && ip.find( '/' ) != std::string::npos ){
+					auto ip_address = cidrs_to_ips( ip );
+					for( auto& address : ip_address )
+						destination.push_back( std::move( address ) );
+				} else if( ip.find( '-' ) != std::string::npos ){
+					auto addresses = ip_from_range( ip );
+					for( auto&address : addresses )
+						destination.push_back( std::move( address ) );
+				} else if( ip.find( '*' ) != std::string::npos ){
+					auto addresses = ip_from_glob( ip );
+					for( auto&address : addresses )
+						destination.push_back( std::move( address ) );
+				} else{
+					destination.push_back( ip );
+				}
+			}
+		}
 	}
 
 	StringList process_port( std::string const & arg_port )
 	{
-		if( arg_port.find( "," ) != std::string::npos ){
+		if( arg_port.find( ',' ) != std::string::npos ){
 			return split_string( arg_port, ',' );
-		} else if( arg_port.find( "-" ) != std::string::npos ){
+		} else if( arg_port.find( '-' ) != std::string::npos ){
 			auto result = split_string( arg_port, '-' );
 			int start = std::stoi( result[0] );
 			int end = std::stoi( result[1] );
@@ -187,38 +301,50 @@ namespace interlace
 			argument.output.pop_back();
 		}
 
-		StringList ports{};
-		StringList real_ports{};
-		StringList ranges{};
-		StringList exclusion_ranges{};
+		StringList ports{}, real_ports{};
+		std::set<std::string> ranges{}, exclusion_ranges{};
+
 		if( !argument.port.empty() ){
 			ports = process_port( argument.port );
 		}
 		if( !argument.real_port.empty() ){
 			real_ports = process_port( argument.real_port );
 		}
-		if( !argument.target.empty() ){
-			ranges.push_back( argument.target );
-		} else{
-			std::ifstream in_file{ argument.target_list };
+		auto is_using_file = []( std::string const & argument ){
+			return argument.size() > 1 && argument[0] == '`'
+				and argument[1] == '`';
+		};
+
+		if( is_using_file( argument.target ) ){
+			std::ifstream in_file{ argument.target.substr( 2 ) };
 			if( !in_file ) throw std::exception( "Unable to open file" );
 			std::string line{};
 			while( std::getline( in_file, line ) ){
-				line = strip( line );
-				if( !line.empty() ) ranges.push_back( line );
+				strip( line );
+				if( !line.empty() ) ranges.insert( std::move( line ) );
 			}
+		} else{
+			ranges.insert( argument.target );
 		}
 		if( !argument.exclusion.empty() ){
-			exclusion_ranges.push_back( argument.exclusion );
-		} else if( !argument.exclusion_list.empty() ){
-			std::ifstream in_file{ argument.exclusion_list };
-			if( !in_file ) throw std::exception( "Unable to open file" );
-			std::string line{};
-			while( std::getline( in_file, line ) ){
-				line = strip( line );
-				if( !line.empty() ) exclusion_ranges.push_back( line );
+			if( is_using_file( argument.exclusion ) ){
+				std::ifstream in_file{ argument.exclusion.substr( 2 ) };
+				if( !in_file ) throw std::exception( "Unable to open file" );
+				std::string line{};
+				while( std::getline( in_file, line ) ){
+					strip( line );
+					if( !line.empty() ) exclusion_ranges.insert( line );
+				}
+			} else{
+				exclusion_ranges.insert( argument.exclusion );
 			}
 		}
+		StringList targets{};
+		pre_process_hosts( ranges, argument, targets );
+		pre_process_hosts( exclusion_ranges, argument, targets );
+		StringList diff{};
+		std::set_difference( targets.cbegin(), targets.cend(), exclusion_ranges.cbegin(),
+			exclusion_ranges.cend(), std::back_inserter( diff ) );
 
 	}
 
